@@ -1,0 +1,236 @@
+import asyncio
+import logging
+import os
+import shelve
+from telegram import Update, Message
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+from telegram.constants import ParseMode
+from dotenv import load_dotenv
+
+load_dotenv()  # Load .env file
+
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Max concurrent tasks to avoid hitting Telegram API limits
+MAX_CONCURRENT_TASKS = 5
+DELAY_BETWEEN_MESSAGES = 0.1  # in seconds
+
+class TelegramRepostBot:
+    def __init__(self, bot_token: str, target_chat_id: str, forward_to_chat_id: str, append_text: str = "\n\nJoin @YourChannel"):
+        self.bot_token = bot_token
+        self.target_chat_id = target_chat_id
+        self.forward_to_chat_id = forward_to_chat_id
+        self.append_text = append_text
+        self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+
+    def _escape_html(self, text: str) -> str:
+        """Basic HTML escaping for Telegram."""
+        if not text:
+            return ""
+        return text.replace('&', '&amp;').replace('<', '<').replace('>', '>')
+
+    def is_processed(self, message_id):
+        """Check if message was already processed"""
+        with shelve.open("processed_messages") as db:
+            return str(message_id) in db
+
+    def mark_as_processed(self, message_id):
+        """Mark message as processed"""
+        with shelve.open("processed_messages") as db:
+            db[str(message_id)] = True
+
+    async def handle_channel_post(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle incoming channel posts concurrently"""
+        message = update.channel_post
+        if not message:
+            return
+
+        # Run each message in its own task
+        asyncio.create_task(self.process_message(update, context))
+
+    async def process_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle message in a concurrent-safe way"""
+        async with self.semaphore:
+            try:
+                message = update.channel_post
+                original_chat_id = message.chat.id
+                original_message_id = message.message_id
+
+                if self.is_processed(original_message_id):
+                    logger.info(f"Skipping already processed message {original_message_id}")
+                    return
+
+                self.mark_as_processed(original_message_id)
+
+                logger.info(f"Processing message {original_message_id} from {original_chat_id}")
+
+                # Delay to avoid hitting Telegram API limits
+                await asyncio.sleep(DELAY_BETWEEN_MESSAGES)
+
+                if message.photo:
+                    await self._handle_photo(context, message, original_chat_id, original_message_id)
+                elif message.video:
+                    await self._handle_video(context, message, original_chat_id, original_message_id)
+                elif message.document:
+                    await self._handle_document(context, message, original_chat_id, original_message_id)
+                elif message.text:
+                    await self._handle_text(context, message, original_chat_id, original_message_id)
+                else:
+                    logger.info(f"Unsupported message type from {original_chat_id}")
+
+            except Exception as e:
+                logger.error(f"Error processing message {original_message_id}: {e}")
+
+    async def _handle_photo(self, context, message, original_chat_id, original_message_id):
+        """Handle photo messages"""
+        try:
+            photo = message.photo[-1]
+            caption = (message.caption or "") + self.append_text
+            bold_caption = f"<b>{self._escape_html(caption)}</b>"
+
+            sent_message = await context.bot.send_photo(
+                chat_id=self.target_chat_id,
+                photo=photo.file_id,
+                caption=bold_caption[:1024],
+                parse_mode=ParseMode.HTML
+            )
+
+            if self.forward_to_chat_id:
+                await self._forward_message(context, sent_message)
+
+            await self._delete_original_message(context, original_chat_id, original_message_id)
+
+            logger.info(f"Successfully reposted photo {original_message_id}")
+
+        except Exception as e:
+            logger.error(f"Error handling photo {original_message_id}: {e}")
+
+    async def _handle_video(self, context, message, original_chat_id, original_message_id):
+        """Handle video messages"""
+        try:
+            caption = (message.caption or "") + self.append_text
+            bold_caption = f"<b>{self._escape_html(caption)}</b>"
+
+            sent_message = await context.bot.send_video(
+                chat_id=self.target_chat_id,
+                video=message.video.file_id,
+                caption=bold_caption[:1024],
+                parse_mode=ParseMode.HTML
+            )
+
+            if self.forward_to_chat_id:
+                await self._forward_message(context, sent_message)
+
+            await self._delete_original_message(context, original_chat_id, original_message_id)
+
+            logger.info(f"Successfully reposted video {original_message_id}")
+
+        except Exception as e:
+            logger.error(f"Error handling video {original_message_id}: {e}")
+
+    async def _handle_document(self, context, message, original_chat_id, original_message_id):
+        """Handle document messages"""
+        try:
+            caption = (message.caption or "") + self.append_text
+            bold_caption = f"<b>{self._escape_html(caption)}</b>"
+
+            sent_message = await context.bot.send_document(
+                chat_id=self.target_chat_id,
+                document=message.document.file_id,
+                caption=bold_caption[:1024],
+                parse_mode=ParseMode.HTML
+            )
+
+            if self.forward_to_chat_id:
+                await self._forward_message(context, sent_message)
+
+            await self._delete_original_message(context, original_chat_id, original_message_id)
+
+            logger.info(f"Successfully reposted document {original_message_id}")
+
+        except Exception as e:
+            logger.error(f"Error handling document {original_message_id}: {e}")
+
+    async def _handle_text(self, context, message, original_chat_id, original_message_id):
+        """Handle text messages"""
+        try:
+            text = message.text + self.append_text
+            bold_text = f"<b>{self._escape_html(text)}</b>"
+
+            sent_message = await context.bot.send_message(
+                chat_id=self.target_chat_id,
+                text=bold_text[:4096],
+                parse_mode=ParseMode.HTML
+            )
+
+            if self.forward_to_chat_id:
+                await self._forward_message(context, sent_message)
+
+            await self._delete_original_message(context, original_chat_id, original_message_id)
+
+            logger.info(f"Successfully reposted text {original_message_id}")
+
+        except Exception as e:
+            logger.error(f"Error handling text {original_message_id}: {e}")
+
+    async def _forward_message(self, context: ContextTypes.DEFAULT_TYPE, message_to_forward: Message):
+        """Forward a message to the specified forward chat."""
+        try:
+            await context.bot.forward_message(
+                chat_id=self.forward_to_chat_id,
+                from_chat_id=message_to_forward.chat.id,
+                message_id=message_to_forward.message_id
+            )
+            logger.info(f"Forwarded message {message_to_forward.message_id}")
+        except Exception as e:
+            logger.error(f"Error forwarding message: {e}")
+
+    async def _delete_original_message(self, context, chat_id, message_id):
+        """Delete the original message safely"""
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            logger.info(f"Deleted original message {message_id}")
+        except Exception as e:
+            logger.warning(f"Failed to delete message {message_id}: {e}")
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Health check/start command"""
+        await update.message.reply_text("Repost bot is running and ready to handle messages.")
+        logger.info("Bot started and responding to /start")
+
+    def run(self):
+        """Start the bot"""
+        application = Application.builder().token(self.bot_token).build()
+
+        # Add handlers
+        application.add_handler(CommandHandler("start", self.start))
+        application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, self.handle_channel_post))
+
+        logger.info("Starting Telegram repost bot...")
+        application.run_polling(allowed_updates=["channel_post"])
+
+
+# Configuration
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
+FORWARD_TO_CHAT_ID = os.getenv("FORWARD_TO_CHAT_ID")
+APPEND_TEXT = os.getenv("APPEND_TEXT")
+
+# Validate required config
+if not BOT_TOKEN or not TARGET_CHAT_ID:
+    raise ValueError("Missing required environment variables: BOT_TOKEN and TARGET_CHAT_ID")
+
+# Run the bot
+if __name__ == "__main__":
+    bot = TelegramRepostBot(
+        bot_token=BOT_TOKEN,
+        target_chat_id=TARGET_CHAT_ID,
+        forward_to_chat_id=FORWARD_TO_CHAT_ID,
+        append_text=APPEND_TEXT
+    )
+    bot.run()
